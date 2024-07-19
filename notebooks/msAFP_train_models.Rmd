@@ -1,0 +1,858 @@
+---
+title: "msAFP Train AFP MoM Models"
+output: html_notebook
+date: "2024-06-28"
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(glue)
+library(broom)
+library(rlang)
+library(furrr)
+
+library(quantreg)
+library(yardstick)
+library(boot)
+library(parallel)
+library(patchwork)
+library(tictoc)
+
+set.seed(9261)
+```
+
+## Import data
+```{r}
+file_in_list <- c("..", "data", "msAFP.processed.csv")
+file_in_path <- do.call(file.path, as.list(file_in_list))
+df_wide <- read_csv(file = file_in_path)
+```
+
+## Process
+```{r}
+df_wide <- df_wide %>%
+  mutate(logAFP = log(AFP))
+
+df_wide$race_factor <- factor(df_wide$race_factor)
+df_wide$race_factor <- relevel(df_wide$race_factor, ref = "White")
+```
+
+### Choose first study per patient
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  group_by(EMPI) %>%
+    arrange(DRAWN_DT_TM) %>%
+    slice(1) %>%
+    ungroup()
+
+log_text <- 'Choose first pregnancy per patient'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+
+## Data checks
+```{r}
+df_wide %>% count(`Number of Fetuses.`)
+```
+
+## Build models
+### Setup training data
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+train_df <- df_wide %>%
+              filter(`Number of Fetuses.` == 1 & 
+                       `Insulin Depend. Diabetic` %in% c("No", "Yes"))
+
+log_text <- 'Training data'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(train_df), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(train_df$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(train_df$EMPI, train_df$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+#### Describe training dataset
+```{r}
+nrow(train_df)
+```
+
+##### By race
+```{r}
+train_df %>% count(race_factor)
+race_values <- unique(train_df$race_factor)
+```
+
+### Train models
+```{r}
+model_1_gw_q <- train_df %>%
+                rq(logAFP ~ gestational_age_weeks + weight, data=., tau=0.5)
+
+model_2_gwr_q <- train_df %>%
+                rq(logAFP ~ gestational_age_weeks + weight + raceBlack, data=., tau=0.5)
+
+model_2_gwr_q2 <- train_df %>%
+                rq(logAFP ~ gestational_age_weeks + weight + race_factor, data=., tau=0.5)
+
+tmp <- train_df
+contrasts(tmp$race_factor) <- contr.sum(5) # Deviation coding
+colnames(contrasts(tmp$race_factor)) <- levels(tmp$race_factor)[1:(length(levels(tmp$race_factor))-1)]
+model_2_gwr_q3 <- tmp %>%
+                rq(logAFP ~ gestational_age_weeks + weight + race_factor, data=., tau=0.5)
+
+tmp <- train_df
+tmp$race_factor <- factor(tmp$race_factor, levels = c("White", "Black", "Asian", "Other", "Hispanic"))
+contrasts(tmp$race_factor) <- contr.sum(5) # Deviation coding
+colnames(contrasts(tmp$race_factor)) <- levels(tmp$race_factor)[1:(length(levels(tmp$race_factor))-1)]
+model_2_gwr_q3b <- tmp %>%
+                rq(logAFP ~ gestational_age_weeks + weight + race_factor, data=., tau=0.5, method = 'fn')
+
+model_dict_qr <- list(m1_gw_q = model_1_gw_q,
+                m2_gwr_q = model_2_gwr_q,
+                m2_gwr_q2 = model_2_gwr_q2,
+                m2_gwr_q3 = model_2_gwr_q3,
+                m2_gwr_q3b = model_2_gwr_q3b)
+
+model_dict <- c(model_dict_qr)
+```
+
+### Describe
+```{r}
+for (m in names(model_dict_qr)) {
+  print(m)
+  tmp <- summary(model_dict[[m]], se="boot")
+  print(tmp)
+  print("======================")
+}
+```
+
+#### Compare two quantile regression models (+/- race)
+```{r}
+anova(model_dict_qr$m1_gw_q, model_dict_qr$m2_gwr_q3, se = 'boot', test='rank')
+```
+
+### Coefficients
+```{r}
+model_coefs <- map(names(model_dict), 
+    \(m) {
+      tmp <- data.frame(coef(model_dict[[m]])) %>%
+        select(1) %>%
+        mutate(coef = row.names(.))
+      names(tmp)[1] <- m
+      return(tmp)
+    }) |> reduce(full_join, by="coef") %>%
+  select(coef, everything()) %>%
+  mutate(across(starts_with("m"), ~round(.x, 3)) )
+
+model_coefs
+```
+### Apply models
+#### Function for adding CIs for AFP_MoM
+```{r}
+gen_sim <- function(AFP_measured, logAFP_fit, logAFP_se_fit, n=1e4, cv_afp=0.04, probs = 0.95) {
+  
+  AFP_measured_sim <- rnorm(n=n, mean=AFP_measured, sd = AFP_measured * cv_afp)
+  logAFP_fit_sim <- rnorm(n=n, mean = logAFP_fit, sd = logAFP_se_fit)
+  
+  df <- data.frame(AFP_measured_sim, 
+                   AFP_fit_sim = exp(logAFP_fit_sim)) %>%
+    mutate(AFP_MoM_sim = AFP_measured_sim / AFP_fit_sim)
+  
+  df_sum <- df %>%
+    summarize(.AFP_MoM_LL = quantile(AFP_MoM_sim, probs = (1 - probs)/2),
+              .AFP_MoM_UL = quantile(AFP_MoM_sim, probs = 1 - (1 - probs)/2))
+  
+  return(df_sum)
+}
+```
+
+#### Predict AFPs and MoMs for each model
+```{r}
+pre_df_sum <- train_df %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+for (m in names(model_dict_qr)) {
+  train_df <- train_df %>%
+      augment(x=model_dict[[m]], newdata=., interval = 'confidence', level=0.95, type='percentile', se='boot') %>%
+      mutate(
+        .se.fit = (.fitted - .lower)/2,
+        .AFP_pred = exp(.fitted),
+        .AFP_MoM = round(AFP / .AFP_pred, 2),
+        .NTD_screen = factor(if_else(`Insulin Depend. Diabetic` == 'No', .AFP_MoM >= 2.5, .AFP_MoM >= 2.0)) ) %>%
+      rowwise() %>%
+        mutate(.AFP_MoM_CIs = gen_sim(AFP_measured = AFP, logAFP_fit = .fitted, logAFP_se_fit = .se.fit, n=1e4)) %>%
+      ungroup() %>%
+      unnest(.AFP_MoM_CIs) %>%
+      nest(!!m := starts_with("."))
+}
+```
+
+#### Aggregate predictions
+```{r}
+predictions <- map(names(model_dict),
+                   \(m) {
+                    train_df %>%
+                        unnest(!!m) %>%
+                        mutate(model = !!m) %>%
+                        select(EMPI, ACCESSION_NUM, ORDER_ID, DRAWN_DT_TM, race_factor, `Insulin Depend. Diabetic`, model, AFP, logAFP, .AFP_pred, .AFP_MoM, .AFP_MoM_LL, .AFP_MoM_UL, .NTD_screen)
+                    })  |> list_rbind()
+```
+
+### Explore models
+#### Overall Median MoMs
+```{r}
+map(names(model_dict), 
+         \(m) {
+          train_df %>%
+              unnest(!!m) %>%
+                summarize(.metric = 'median_MoM',
+                          .estimator = 'standard',
+                          .estimate = median(.AFP_MoM)) %>%
+                mutate(model = !!m) %>%
+              select(model, everything())
+            }) |> list_rbind() %>%
+  arrange(model) %>%
+  select(model, .estimate)
+```
+
+#### Generate metrics by race
+```{r}
+# Regression metrics
+multi_metric <- metric_set(rsq, mpe, ccc)
+metrics_reg <- map(names(model_dict), 
+                   \(m) {
+                    train_df %>%
+                        unnest(!!m) %>%
+                        group_by(race_factor) %>%
+                          multi_metric(logAFP, .fitted) %>%
+                          mutate(model = !!m) %>%
+                        ungroup() %>%
+                        select(model, everything())
+                    })  |> list_rbind()
+
+# Classification metrics
+class_metric <- metric_set(demographic_parity(by=race_factor))
+metrics_class <- map(names(model_dict), 
+                   \(m) {
+                    train_df %>%
+                        unnest(!!m) %>%
+                          class_metric(truth=.NTD_screen, estimate=.NTD_screen) %>%
+                          mutate(model = !!m) %>%
+                        ungroup() %>%
+                        select(model, everything())
+                    })  |> list_rbind()
+
+# MoM metrics
+metrics_MoM <- map(names(model_dict), 
+                   \(m) {
+                    train_df %>%
+                        unnest(!!m) %>%
+                        group_by(race_factor) %>%
+                          summarize(.metric = 'median_MoM',
+                                    .estimator = 'standard',
+                                    .estimate = median(.AFP_MoM)) %>%
+                          mutate(model = !!m) %>%
+                        ungroup() %>%
+                        select(model, everything())
+                      }) |> list_rbind()
+
+# % positive
+metrics_ppos <- map(names(model_dict), 
+                   \(m) {
+                    train_df %>%
+                        unnest(!!m) %>%
+                        group_by(race_factor) %>%
+                          summarize(.metric = '% pos',
+                                    .estimator = 'standard',
+                                    .estimate = sum(.NTD_screen == TRUE) / n() * 100) %>%
+                          mutate(model = !!m) %>%
+                        ungroup() %>%
+                        select(model, everything())
+                      }) |> list_rbind()
+
+# Compare to base model (m1_gw_q)
+metrics_MoM2 <- map(names(model_dict), 
+                    \(m) {
+                      train_df %>%
+                          unnest(m1_gw_q) %>%
+                          mutate(m1_gw_q_AFP_MoM = .AFP_MoM) %>%
+                          nest(m1_gw_q = starts_with(".")) %>%
+                          unnest(!!m) %>%
+                          group_by(race_factor) %>%
+                            summarize(.metric = 'q95_abs_delta_MoM',
+                                      .estimator = 'standard',
+                                      .estimate = quantile(abs(.AFP_MoM - m1_gw_q_AFP_MoM), probs=0.95)) %>%
+                            mutate(model = !!m) %>%
+                          ungroup() %>%
+                          select(model, everything())
+                      }) |> list_rbind()
+```
+
+#### Consolidate metrics by race
+```{r}
+metrics_by_race <- map(race_values,
+                               \(r) {
+                                  metrics_reg %>% 
+                                    filter(race_factor == r) %>%
+                                    mutate(value=round(x=.estimate, digits=3)) %>%
+                                    pivot_wider(id_cols = model, names_from = .metric, values_from = value) %>%
+                                    left_join(metrics_MoM %>% 
+                                                filter(race_factor == r) %>%
+                                                mutate(MoM_median=round(x=.estimate, digits=3)) %>%
+                                                select(model, MoM_median),
+                                              by="model") %>%
+                                    left_join(metrics_MoM2 %>% 
+                                                filter(race_factor == r) %>%
+                                                mutate(q95_abs_delta_MoM=round(x=.estimate, digits=3)) %>%
+                                                select(model, q95_abs_delta_MoM),
+                                              by="model") %>%
+                                    left_join(metrics_ppos %>% 
+                                                filter(race_factor == r) %>%
+                                                mutate(`% pos`=round(x=.estimate, digits=2)) %>%
+                                                select(model, `% pos`),
+                                              by="model") %>%                                   
+                                    mutate(race_factor = r)
+                                }) |> list_rbind()
+```
+
+```{r}
+metrics_by_race %>% filter(race_factor == "Black")
+```
+
+```{r}
+metrics_by_race %>% filter(race_factor == "White")
+```
+
+```{r}
+metrics_by_race %>% filter(race_factor == "Asian")
+```
+
+```{r}
+metrics_by_race %>% filter(race_factor == "Hispanic")
+```
+
+```{r}
+metrics_by_race %>% filter(race_factor == "Other")
+```
+
+#### Review by model
+##### m1_gw_q
+```{r}
+metrics_by_race %>%
+  filter(model == "m1_gw_q") %>%
+  select(race_factor, MoM_median) %>%
+  arrange(as.character(race_factor))
+```
+
+##### m2_gwr_q3
+```{r}
+metrics_by_race %>%
+  filter(model == "m2_gwr_q3") %>%
+  select(race_factor, MoM_median) %>%
+  arrange(as.character(race_factor))
+```
+
+### Validate that AFP MoM's from m2_gwr_q3 are similar to clinical MoM's
+#### Correlation
+```{r}
+train_df %>%
+  filter(!is.na(MS1_MOM) & (MS1_MOM != 0)) %>%
+  unnest(m2_gwr_q3) %>%
+  summarize(N=n(),
+            correlation = cor(.AFP_MoM, MS1_MOM, method = "spearman"),
+            rsq = summary(lm(MS1_MOM ~ .AFP_MoM, data = .))$r.squared)
+```
+
+#### Scatterplot
+```{r}
+train_df %>%
+  filter(!is.na(MS1_MOM) & (MS1_MOM != 0)) %>%
+  unnest(m2_gwr_q3) %>%
+  ggplot(aes(x=MS1_MOM, y=.AFP_MoM)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE) +
+    geom_abline(intercept = 0, slope = 1) +
+    labs(x="Clinical MoM", y="Model MoM") +
+    xlim(0, 5) + ylim(0, 5) +
+    theme_minimal()
+```
+
+### Evaluate patient-level differences between AFP MoM's
+#### Overlap between CI's of m1_gw_q and m2_gwr_q AFP_MoMs
+#### Difference between medians
+```{r}
+train_df %>%
+  filter(!is.na(MS1_MOM) & (MS1_MOM != 0)) %>%
+  unnest(m1_gw_q, names_sep = "") %>%
+  unnest(m2_gwr_q3, names_sep = "") %>%
+  mutate(overlap_1 = ( (m1_gw_q.AFP_MoM_LL <= m2_gwr_q3.AFP_MoM_LL) &
+                      (m1_gw_q.AFP_MoM_UL >= m2_gwr_q3.AFP_MoM_LL)),
+         overlap_2 = ( (m1_gw_q.AFP_MoM_LL <= m2_gwr_q3.AFP_MoM_UL) &
+                       (m1_gw_q.AFP_MoM_UL >= m2_gwr_q3.AFP_MoM_LL) ),
+         within_0.1 = abs(m1_gw_q.AFP_MoM - m2_gwr_q3.AFP_MoM) <= 0.1,
+         within_0.2 = abs(m1_gw_q.AFP_MoM - m2_gwr_q3.AFP_MoM) <= 0.2) %>%
+  summarize(N = n(),
+            `overlap %` = sum(overlap_1 | overlap_2) / N * 100,
+            within_0.1 = sum(within_0.1) / N * 100,
+            within_0.2 = sum(within_0.2) / N * 100)
+```
+
+### Describe model classification concordance
+```{r}
+train_df %>%
+  unnest(m1_gw_q, names_sep = "") %>%
+  unnest(m2_gwr_q3, names_sep = "") %>%
+  count(m1_gw_q.NTD_screen, m2_gwr_q3.NTD_screen) %>%
+  mutate(`%` = n / sum(n) * 100)
+```
+
+```{r}
+train_df %>%
+  unnest(m1_gw_q, names_sep = "") %>%
+  unnest(m2_gwr_q3, names_sep = "") %>%
+  filter(m1_gw_q.NTD_screen != m2_gwr_q3.NTD_screen) %>%
+  count(race_factor, m1_gw_q.NTD_screen, m2_gwr_q3.NTD_screen) %>%
+  mutate(`%` = n / sum(n) * 100)
+```
+
+#### Discordant interpretations
+```{r}
+train_df %>%
+  unnest(m1_gw_q, names_sep = "") %>%
+  unnest(m2_gwr_q3, names_sep = "") %>%
+  filter(m1_gw_q.NTD_screen != m2_gwr_q3.NTD_screen) %>%
+  mutate(AFP_MoM_diff = m1_gw_q.AFP_MoM - m2_gwr_q3.AFP_MoM) %>%
+  select(contains("AFP_MoM")) %>%
+  arrange(AFP_MoM_diff)
+```
+
+### Assess for association between positivity and race
+#### msAFP model
+```{r}
+m1_gw_cross_counts <- train_df %>%
+  # filter(race_factor %in% c("Black", "White")) %>%
+  unnest(m1_gw_q) %>%
+  mutate(screen_result = case_match(.NTD_screen,
+                                    "TRUE" ~ "Positive", 
+                                    "FALSE" ~ "Negative")) %>%
+  count(raceBlack, screen_result) %>%
+  pivot_wider(names_from = screen_result, values_from = n) %>%
+  mutate(`%Pos` = `Positive` / (`Positive` + `Negative`) * 100,
+         NNT_positive = round(1 / (`%Pos`/100)))
+
+m1_gw_cross_counts
+```
+
+##### Fisher's exact test
+```{r}
+m1_gw_cross_counts %>%
+  select(Negative, Positive) %>%
+  fisher.test()
+```
+
+##### Test of proportions
+```{r}
+prop.test(x=m1_gw_cross_counts$`Positive`, 
+          n=m1_gw_cross_counts$`Positive` + m1_gw_cross_counts$`Negative`, 
+          alternative = "two.sided")
+```
+
+#### msAFP-r model
+```{r}
+m2_gwr_cross_counts <- train_df %>%
+  # filter(race_factor %in% c("Black", "White")) %>%
+  unnest(m2_gwr_q) %>%
+  mutate(screen_result = case_match(.NTD_screen,
+                                    "TRUE" ~ "Positive", 
+                                    "FALSE" ~ "Negative")) %>%
+  count(raceBlack, screen_result) %>%
+  pivot_wider(names_from = screen_result, values_from = n) %>%
+  mutate(`%Pos` = `Positive` / (`Positive` + `Negative`) * 100,
+         NNT_positive = round(1 / (`%Pos`/100)))
+
+m2_gwr_cross_counts
+```
+
+##### Fisher's exact test
+```{r}
+m2_gwr_cross_counts %>%
+  select(Negative, Positive) %>%
+  fisher.test()
+```
+
+##### Test of proportions
+```{r}
+prop.test(x=m2_gwr_cross_counts$`Positive`, 
+          n=m2_gwr_cross_counts$`Positive` + m2_gwr_cross_counts$`Negative`,
+          alternative = "two.sided")
+```
+
+#### Difference in positive rate
+```{r}
+tmp <- inner_join(m1_gw_cross_counts,
+           m2_gwr_cross_counts,
+           by="raceBlack",
+           suffix=c("_msAFP", "_msAFP-r"))
+  
+tmp %>%
+  select(raceBlack, starts_with("%Pos")) %>%
+  pivot_longer(cols = starts_with("%Pos"), names_to = "model", values_to = "%Pos", names_prefix = "%Pos_") %>%
+  pivot_wider(names_from = raceBlack, values_from = "%Pos") %>%
+  mutate(`Diff_%_pos` = `1` - `0`)
+
+tmp %>%
+  select(raceBlack, starts_with("%Pos")) %>%
+  pivot_longer(cols = starts_with("%Pos"), names_to = "model", values_to = "%Pos", names_prefix = "%Pos_") %>%
+  pivot_wider(names_from = raceBlack, values_from = "%Pos") %>%
+  mutate(`Diff_%_pos` = `1` - `0`) %>%
+  summarize(diff_diff = `Diff_%_pos`[1] - `Diff_%_pos`[2],
+            NNT_diff = round(1 / (diff_diff/100)) )
+```
+
+### QQplot
+```{r}
+gq1 <- train_df %>%
+  unnest(m1_gw_q, names_sep = "") %>%
+  ggplot(aes(sample = m1_gw_q.AFP_MoM, color=race_factor), alpha=0.5) +
+    stat_qq() +
+    stat_qq_line() +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  geom_vline(xintercept = 2.5, linetype = "dashed", color = "black")
+
+gq1
+gq1 + coord_cartesian(xlim = c(2, 4))
+```
+
+```{r}
+gq2 <- train_df %>%
+  unnest(m2_gwr_q3, names_sep = "") %>%
+  ggplot(aes(sample = m2_gwr_q3.AFP_MoM, color=race_factor), alpha=0.5) +
+    stat_qq() +
+    stat_qq_line() +
+  scale_color_brewer(palette = "Set1") +
+  coord_cartesian(xlim = c(1, 4)) +
+  theme_bw() +
+  geom_vline(xintercept = 2.5, linetype = "dashed", color = "black")
+
+gq2
+gq2 + coord_cartesian(xlim = c(2, 4))
+```
+
+### Figures
+#### Figure 1: Median AFP MoM's by race
+##### Generate CIs
+```{r}
+# Bootstrap median AFP MoMs to estimate CIs
+median_AFP_MoM_bygroup <- function(data, 
+                                   indices, 
+                                   grouping_factor) {
+
+        tmp_df <- data[indices,]  
+        
+        tmp_df %>%
+          group_by(across(all_of(grouping_factor))) %>%
+          summarize(AFP_MoM_median = median(.AFP_MoM)) %>%
+          select(AFP_MoM_median) %>%
+          pull() %>%
+          return()
+}
+```
+
+###### Race in categories
+```{r}
+tic()
+cl <- makeCluster(8)
+boot_res <- list()
+models <- c('m1_gw_q', 'm2_gwr_q3')
+boot_res <- map(models, 
+    \(m) {
+      train_df %>%
+          unnest(m) %>%
+          boot(data = ., 
+               statistic = median_AFP_MoM_bygroup, 
+               grouping_factor = 'race_factor',
+               R = 1e4, 
+               sim="ordinary", 
+               stype="i",
+               parallel = "snow", cl=cl)
+    })
+names(boot_res) <- models
+stopCluster(cl)
+toc()
+```
+
+
+```{r}
+race_levels <- levels(train_df$race_factor)
+plan(multisession, workers = 8)
+tic()
+median_cis <- future_map(c('m1_gw_q', 'm2_gwr_q3'),
+                  \(m) {
+                        future_map(1:length(race_levels),
+                           \(r) {
+                             tmp <- data.frame(model=m,
+                                        race_factor = race_levels[r])
+                             
+                             if (length(unique(boot_res[[m]]$t[,r])) > 1) {
+                                boot_ci_res <- boot.ci(boot_res[[m]], conf=0.95, type="bca", index=r)
+                             
+                                tmp <- tmp %>%
+                                  mutate(AFP_MoM_median_med = boot_ci_res$t0,
+                                              AFP_MoM_median_lower = boot_ci_res$bca[4],
+                                              AFP_MoM_median_upper = boot_ci_res$bca[5])
+                             } else {
+                               tmp <- tmp %>%
+                                 mutate(AFP_MoM_median_med = boot_res[[m]]$t[1,r],
+                                        AFP_MoM_median_lower = boot_res[[m]]$t[1,r],
+                                        AFP_MoM_median_upper = boot_res[[m]]$t[1,r])
+                             }
+                               return(tmp)
+                            })  |> list_rbind()
+                  }) |> list_rbind()
+plan(sequential)
+toc()
+
+median_cis <- median_cis %>%
+  mutate(race_factor = factor(race_factor, levels = c("Asian", "Black", "Hispanic", "Other", "White")))
+
+median_cis
+```
+
+##### Black versus non-Black
+```{r}
+tic()
+cl <- makeCluster(8)
+boot_res_binary <- list()
+models <- c('m1_gw_q', 'm2_gwr_q3')
+boot_res_binary <- map(models, 
+    \(m) {
+      train_df %>%
+          unnest(m) %>%
+          boot(data = ., 
+               statistic = median_AFP_MoM_bygroup, 
+               grouping_factor = 'raceBlack',
+               R = 1e4, 
+               sim="ordinary", 
+               stype="i",
+               parallel = "snow", cl=cl)
+    })
+names(boot_res_binary) <- models
+stopCluster(cl)
+toc()
+```
+
+```{r}
+tic()
+plan(multisession, workers = 8)
+race_levels <- c("Non-Black", "Black")
+median_cis_binary <- future_map(c('m1_gw_q', 'm2_gwr_q3'),
+                  \(m) {
+                        future_map(1:length(race_levels),
+                           \(r) {
+                             tmp <- data.frame(model=m,
+                                        raceBlack = race_levels[r])
+                             
+                             if (length(unique(boot_res_binary[[m]]$t[,r])) > 1) {
+                                boot_ci_res <- boot.ci(boot_res_binary[[m]], conf=0.95, type="bca", index=r)
+                             
+                                tmp <- tmp %>%
+                                  mutate(AFP_MoM_median_med = boot_ci_res$t0,
+                                              AFP_MoM_median_lower = boot_ci_res$bca[4],
+                                              AFP_MoM_median_upper = boot_ci_res$bca[5])
+                             } else {
+                               tmp <- tmp %>%
+                                 mutate(AFP_MoM_median_med = boot_res_binary[[m]]$t[1,r],
+                                        AFP_MoM_median_lower = boot_res_binary[[m]]$t[1,r],
+                                        AFP_MoM_median_upper = boot_res_binary[[m]]$t[1,r])
+                             }
+                               return(tmp)
+                            })  |> list_rbind()
+                  }) |> list_rbind()
+plan(sequential)
+toc()
+
+median_cis_binary <- median_cis_binary %>%
+  mutate(raceBlack = factor(raceBlack, levels = race_levels))
+
+median_cis_binary
+```
+
+```{r}
+median_cis_wide <- median_cis %>%
+  mutate(model = substr(model, 1, 2)) %>%
+  pivot_wider(id_cols = race_factor, 
+              names_from = model, 
+              values_from = c(AFP_MoM_median_med, AFP_MoM_median_lower, AFP_MoM_median_upper))
+median_cis_wide
+```
+
+```{r}
+# Plot 
+gg <- median_cis_wide %>%
+        ggplot(., 
+             aes(group = race_factor)) +
+  
+  geom_point(aes(x = race_factor,
+                 y = AFP_MoM_median_med_m1,
+                 color = "msAFP"), 
+             position = position_dodge(width = 0.2), size = 3) +
+  geom_point(aes(x = as.numeric(factor(race_factor)) + 0.2, 
+                 y = AFP_MoM_median_med_m2, 
+                 color = "msAFP-r"), 
+             position = position_dodge(width = 0.2), size = 3) +
+  
+  geom_errorbar(aes(x = race_factor,
+                    ymin = AFP_MoM_median_lower_m1, ymax = AFP_MoM_median_upper_m1,
+                    color="msAFP"), 
+                width = 0.1, 
+                position = position_dodge(width = 0.2)) +
+  geom_errorbar(aes(x = as.numeric(factor(race_factor)) + 0.2, 
+                    ymin = AFP_MoM_median_lower_m2, ymax = AFP_MoM_median_upper_m2,
+                    color="msAFP-r"), 
+                width = 0.1, position = position_dodge(width = 0.2)) +
+  
+  labs(x = NULL, y = "Median AFP MoM") +
+  scale_color_manual(values = c("msAFP" = "blue", "msAFP-r" = "red")) +
+  geom_hline(yintercept = 1.0, linetype = "dashed", color = "black") +
+  coord_cartesian(ylim = c(0.88, 1.10)) +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "top")
+
+ggsave("../output/Figure1.pdf", plot = gg, width = 8, height = 5, units = "in")
+ggsave("../output/Figure1.svg", plot = gg, width = 8, height = 5, units = "in")
+ggsave("../output/Figure1.eps", plot = gg, width = 8, height = 5, units = "in")
+ggsave("../output/Figure1.png", plot = gg, width = 8, height = 5, units = "in")
+
+gg
+
+```
+
+## Figure 2: Comparison of AFP MoMs
+### A
+```{r, fig.width=4, fig.height=4, fig.units="in", fig.align="center"}
+tmp <- train_df %>%
+  filter(`Insulin Depend. Diabetic` == 'No') %>%
+  unnest(c(m1_gw_q, m2_gwr_q3), names_sep = "") %>%
+  select(race_factor, m1_gw_q.AFP_MoM, m2_gwr_q3.AFP_MoM) %>%
+  mutate(race_factor = factor(race_factor, levels = c("Asian", "Black", "Hispanic", "Other", "White")) )
+
+fig2a <- tmp %>%
+      ggplot(., 
+            aes(x = m2_gwr_q3.AFP_MoM, y = m1_gw_q.AFP_MoM, 
+                color = race_factor)) +
+  geom_point(alpha=0.3) + 
+  geom_hline(yintercept = 2.5, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 2.5, linetype = "dashed", color = "black") +
+  
+  scale_color_brewer(palette = "Set1") +
+  
+  labs(color = "Race/Ethnicity") +
+  scale_x_continuous(name = "msAFP-r MoM", limits=c(0, 6)) +
+  scale_y_continuous(name = "msAFP MoM", limits = c(0, 6)) +
+  geom_rect(aes(xmin = 2, xmax = 3, ymin = 2, ymax = 3), fill = NA, color = "purple", linetype = "dotted") +
+  theme_bw() +
+  theme(
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(),
+        legend.position = "none")
+fig2a
+```
+
+##### B
+```{r, fig.width=4, fig.height=4, fig.units="in", fig.align="center"}
+tmp <- train_df %>%
+  filter(`Insulin Depend. Diabetic` == 'No') %>%
+  unnest(c(m1_gw_q, m2_gwr_q3), names_sep = "") %>%
+  mutate(discordant = if_else(m1_gw_q.NTD_screen != m2_gwr_q3.NTD_screen, "Discordant", "Concordant")) %>%
+  select(ORDER_ID, `Insulin Depend. Diabetic`, race_factor, discordant, m1_gw_q.AFP_MoM, m2_gwr_q3.AFP_MoM) %>%
+  filter( (m1_gw_q.AFP_MoM >= 2 & m1_gw_q.AFP_MoM <= 3) |
+            (m2_gwr_q3.AFP_MoM >= 2 & m2_gwr_q3.AFP_MoM <= 3)) %>%   # Include patients for which one result is within 2-3
+  pivot_longer(cols = c("m1_gw_q.AFP_MoM", "m2_gwr_q3.AFP_MoM"), 
+               names_to = "variable", 
+               values_to = "value") %>%
+  mutate(race_factor = factor(race_factor, levels = c("Asian", "Black", "Hispanic", "Other", "White")) )
+
+fig2b <- tmp %>%
+      ggplot(., 
+            aes(x = variable, y = value, 
+                group = ORDER_ID, 
+                alpha = discordant)) +
+  coord_cartesian(xlim = c(0.8, 2.2), ylim = c(1.75, 3.1), expand = FALSE) +
+  geom_point(aes(color = race_factor)) + 
+  geom_line(aes(color = race_factor, linewidth = discordant)) +
+  geom_hline(yintercept = 2.5, linetype = "dashed", color = "black") +
+  
+  scale_alpha_manual(values = c(0.1, 1), guide = "none") + 
+  scale_color_brewer(palette = "Set1") +
+  scale_linewidth_manual(values = c(0.5, 0.8), guide = "none") +
+  
+  labs(color = "Race/Ethnicity") +
+  scale_x_discrete(name = "", labels = c("msAFP", "msAFP-r")) +
+  scale_y_continuous(name = "AFP MoM", breaks = seq(2, 3, 0.5)) +
+  theme_bw() +
+  
+  theme(panel.background = element_blank(),  
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(size = 14, face="bold"), 
+        axis.text.y = element_text(size = 12),
+        axis.title.y = element_text(size = 14, face="bold"),
+        panel.border = element_blank(),
+        axis.line = element_line(),
+        legend.text = element_text(size = 10),  
+        legend.title = element_text(size = 12, face="bold")) 
+
+fig2b
+```
+
+```{r, fig.width=8, fig.height=4, fig.units="in", fig.align="center"}
+fig2 <- fig2a + fig2b +
+  plot_annotation(tag_levels = "A",
+                  theme = theme(plot.tag = element_text(size = 20, face = "bold")) )
+
+ggsave("../output/Figure2.pdf", plot = fig2, width = 8, height = 4, units = "in")
+ggsave("../output/Figure2.svg", plot = fig2, width = 8, height = 5, u.Pnits = "in")
+ggsave("../output/Figure2.eps", plot = fig2, width = 8, height = 5, units = "in")
+ggsave("../output/Figure2.png", plot = fig2, width = 8, height = 5, units = "in")
+
+
+fig2
+```
+
+```{r}
+sessionInfo()
+```
+

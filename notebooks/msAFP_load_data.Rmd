@@ -1,0 +1,603 @@
+---
+title: "msAFP Load data"
+output: html_notebook
+date: "2024-06-28"
+---
+
+Goal: Import msAFP Cerner LIS and Maciel data
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(glue)
+```
+
+## Load Cerner
+```{r}
+col_spec <- cols(EMPI = col_character(),
+                 HUP_MRN = col_character(),
+                ORDER_ID = col_double(),
+                ACCESSION = col_character(),
+                ORDER_ALIAS_NUMBER = col_double(),
+                TASK_ASSAY_CD = col_double(),
+                DTA = col_character(),
+                PERFORM_RESULT_ID = col_double(),
+                RESULT_STATUS = col_character(),
+                ASCII_TEXT = col_character(),
+                RESULT_VALUE_NUMERIC = col_double(),
+                RESULT_VALUE_ALPHA = col_character(),
+                RESULT_VALUE_DT_TM = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+                LESS_GREAT_FLAG = col_double(),
+                EVENT_DT_TM = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+                EVENT_TYPE_CD = col_integer(),
+                PERFORM_DT_TM = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+                RESULT_UPDT_DT_TM = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+                SERVICE_RESOURCE = col_character(),
+                DRAWN_DT_TM = col_datetime(format = "%Y-%m-%d %H:%M:%S"),
+                RECEIVED_DT_TM = col_datetime() # Some are only day
+              )
+
+file_in <- "AFP_results.20240325b.csv"
+file_dirs <- c("Pathology_Analytics", "msAFP")
+if (.Platform$OS.type == 'windows') { fp_list <- c("I:", file_dirs, file_in)
+} else { fp_list <- c("/Volumes", file_dirs, file_in) }
+fp <- do.call(file.path, as.list(fp_list))
+
+df <- read_csv(fp, col_types = col_spec)
+```
+
+```{r}
+unlist(file_dirs)
+```
+
+## Process Cerner
+### Fix inputs
+```{r}
+# Fix time zone
+df <- df %>%
+  mutate(across(ends_with("DT_TM"), ~ . - hours(4)))
+```
+
+```{r}
+# Extract accession last 9
+df <- df %>%
+  mutate(ACCESSION_NUM = paste(substring(ACCESSION, 9, 12), 
+                               substring(ACCESSION, 14, 19),
+                               sep="") %>% as.numeric())
+```
+
+```{r}
+# Fix MRN
+df <- df %>%
+  mutate(HUP_MRN = sprintf("%09d", as.numeric(HUP_MRN)))
+```
+
+```{r}
+# Set result status as ordered factor
+df <- df %>%
+  mutate(RESULT_STATUS = factor(x=RESULT_STATUS, levels = c("Corrected", "Verified", "Old Corrected", "Old Verified", "Old Performed"), 
+                                ordered=TRUE))
+```
+
+```{r}
+# Pick final result
+## TODO -- pick latest EMPI
+pre_df_sum <- df %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_results = n_distinct(ORDER_ID, TASK_ASSAY_CD))
+
+df <- df %>%
+  group_by(ORDER_ID, TASK_ASSAY_CD) %>%
+    arrange(desc(EVENT_DT_TM)) %>%
+    slice(1) %>%
+    ungroup()
+
+log_text <- 'Pick final result'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Results {result_start}->{result_end} (Diff: {result_diff})',
+        text=log_text, result_start = pre_df_sum$N_results, result_end = n_distinct(df$ORDER_ID, df$TASK_ASSAY_CD), result_diff = result_start - result_end)
+
+df %>% count(RESULT_STATUS)
+```
+
+TODO: What patients am I dropping with picking final result?
+
+## Pivot Cerner
+```{r}
+orders <- df %>%
+              select(EMPI, ACCESSION_NUM, ORDER_ID, DRAWN_DT_TM) %>%
+                distinct()
+
+df_wide_1 <- df %>%
+  select(ORDER_ID, DTA, ASCII_TEXT) %>%
+  filter(!DTA %in% c("AFP", "AFPI", "Est'd Date of Delivery")) %>%
+  filter(!is.na(ASCII_TEXT)) %>%
+  pivot_wider(id_cols = ORDER_ID, names_from = DTA, values_from = ASCII_TEXT) %>%
+  mutate(weight = as.numeric(`Maternal Weight.`))
+
+df_wide_2 <- df %>% 
+  select(ORDER_ID, DTA, RESULT_VALUE_NUMERIC) %>%
+  filter(DTA == "AFP") %>%
+  filter(!is.na(RESULT_VALUE_NUMERIC)) %>%
+  pivot_wider(id_cols = ORDER_ID, names_from = DTA, values_from = RESULT_VALUE_NUMERIC)
+
+df_wide_3 <- df %>%
+  select(ORDER_ID, DTA, RESULT_VALUE_DT_TM) %>%
+  filter(DTA == "Est'd Date of Delivery") %>%
+  filter(!is.na(RESULT_VALUE_DT_TM)) %>%
+  pivot_wider(id_cols = ORDER_ID, names_from = DTA, values_from = RESULT_VALUE_DT_TM)
+
+df_wide_4 <- df %>%
+  select(ORDER_ID, DTA, RESULT_VALUE_ALPHA) %>%
+  filter(DTA == "AFPI") %>%
+  filter(!is.na(RESULT_VALUE_ALPHA)) %>%
+  pivot_wider(id_cols = ORDER_ID, names_from = DTA, values_from = RESULT_VALUE_ALPHA)
+
+df_wide <- orders %>%
+              full_join(df_wide_1, by="ORDER_ID") %>%
+              full_join(df_wide_2, by="ORDER_ID") %>%
+              full_join(df_wide_3, by="ORDER_ID") %>%
+              full_join(df_wide_4, by="ORDER_ID")
+```
+## Create dataset
+### Filters
+#### Exclude for EDD missingness
+```{r}
+# of Rows before Filtering
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  filter(!is.na(`Est'd Date of Delivery`))
+
+log_text <- 'EDD missing'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+#### Add Gestational Age 
+```{r}
+df_wide <- df_wide %>%
+  mutate(days_until_EDD = difftime(`Est'd Date of Delivery`, as_date(DRAWN_DT_TM), units="days") %>% as.numeric,
+         gestational_age_days = 40 * 7 - days_until_EDD,
+         gestational_age_weeks = gestational_age_days / 7,
+         gestational_age = paste(floor(gestational_age_weeks), gestational_age_days %% 7, sep="+"))
+```
+
+#### Exclude GA >= 22 or GA < 15
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+              filter(gestational_age_weeks >= 15 &
+                       gestational_age_weeks < 22)
+log_text <- 'GA <15 or >= 22'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+#### Exclude for missing AFP result
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  filter(!is.na(AFP))
+
+log_text <- 'AFP missing'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+#### Exclude for missing weight
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  filter(!is.na(weight))
+
+log_text <- 'Weight missing'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+#### Check for further missingeness
+```{r}
+InputData <- c("Indication for testing", "EDD Determ by", "Number of Fetuses.", 
+                          "weight", "Insulin Depend. Diabetic", "Maternal Race.", 
+                          "Hx of Neural Tube Defects", "AFP", "Est'd Date of Delivery")
+df_wide %>%
+  summarise(across(all_of(InputData), ~ sum(is.na(.))))
+```
+
+#### Exclude repeats within pregnancy
+##### Check samples flagged as repeat testing
+```{r}
+tmp <- df_wide %>%
+  filter(`Indication for testing` == 'Repeat testing') %>%
+  select(EMPI, ORDER_ID) %>%
+  mutate(flagged_as_repeat = TRUE)
+
+n_repeats <- df_wide %>%
+  inner_join(tmp %>% select(EMPI) %>% distinct(), by=c("EMPI")) %>%
+  left_join(tmp, by=c("EMPI", "ORDER_ID")) %>%
+  mutate(flagged_as_repeat=if_else(is.na(flagged_as_repeat), FALSE, flagged_as_repeat)) %>% 
+  group_by(EMPI) %>%
+    mutate(weeks_difference = difftime(DRAWN_DT_TM, DRAWN_DT_TM[flagged_as_repeat], units='weeks') %>% as.numeric()) %>%
+    filter((n() > 1) & 
+              any(abs(weeks_difference) < 20 & 
+                    (weeks_difference != 0)) 
+           ) %>%
+    ungroup() %>%
+  select(EMPI, ORDER_ID, `Indication for testing`, flagged_as_repeat, DRAWN_DT_TM, weeks_difference)
+
+glue('Cases flagged as repeats that appear to warrange exclusion: {nrow(n_repeats)}')
+```
+
+
+##### Identify repeat testing
+```{r}
+EMPI_repeats <- df_wide %>%
+  count(EMPI) %>%
+  filter(n > 1)
+EMPI_repeats
+
+# Identify EMPIs with tests within 20 weeks
+cases_to_exclude <- df_wide %>%
+  inner_join(EMPI_repeats %>% select(EMPI) %>% distinct(), by=c("EMPI")) %>%
+  arrange(EMPI, DRAWN_DT_TM) %>%
+  group_by(EMPI) %>%
+    mutate(weeks_difference = difftime(DRAWN_DT_TM, lag(DRAWN_DT_TM), units='weeks') %>% as.numeric()) %>%
+    filter(!is.na(weeks_difference) & 
+                  weeks_difference < 20) %>%
+    ungroup() %>%
+  select(EMPI, ORDER_ID, `Indication for testing`, DRAWN_DT_TM, weeks_difference)
+
+df_wide %>%
+  inner_join(cases_to_exclude %>% select(EMPI) %>% distinct(), by=c("EMPI")) %>%
+  left_join(cases_to_exclude %>% select(EMPI, ORDER_ID, weeks_difference), by=c("EMPI", "ORDER_ID")) %>%
+  select(EMPI, ORDER_ID, `Indication for testing`, DRAWN_DT_TM, weeks_difference, gestational_age_weeks, AFP) %>%
+  arrange(EMPI, DRAWN_DT_TM)
+```
+
+##### Apply repeat testing exclusion
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  anti_join(cases_to_exclude, by=c("EMPI", "ORDER_ID"))
+
+log_text <- 'Duplicate testing within pregnancy'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+### Adjust variables
+#### Race
+##### Describe Race variable
+```{r}
+df_wide %>% count(`Maternal Race.`)
+```
+
+##### Remap race
+```{r}
+df_wide <- df_wide %>%
+  mutate(race = case_when(
+                    `Maternal Race.` %in% c("White", "White3") ~ 'White',
+                    `Maternal Race.` %in% c("Asia", "Asian") ~ 'Asian',
+                    `Maternal Race.` %in% c("Unknown", "Other") ~ 'Other',
+                    TRUE ~ `Maternal Race.`),
+         race_factor = factor(race, levels = c("White", "Black", "Hispanic", "Asian", "Other")),
+         raceBlack = if_else(race_factor == "Black", 1, 0)
+      )
+
+df_wide %>%
+  count(race_factor, raceBlack)
+```
+## Load Maciel
+```{r}
+maciel_col_spec <- cols(
+  ACCESSION = col_double(),
+  USER_ID = col_character(),
+  PAT_DOB = col_character(),
+  NAME_LAST = col_character(),
+  NAME_FIRST = col_character(),
+  NAME = col_character(),
+  TEST_TYPE = col_character(),
+  GRAV = col_double(),
+  PARA = col_double(),
+  ABORT = col_double(),
+  SAB = col_double(),
+  PAT_HT_FT = col_double(),
+  PAT_HT_IN = col_double(),
+  PAT_WT = col_double(),
+  PAT_RACE = col_character(),
+  PHYS_CODE = col_double(),
+  ATTENTION1 = col_character(),
+  PHYS_CODE2 = col_logical(),
+  ATTENTION2 = col_logical(),
+  DIABETIC = col_character(),
+  SMOKE = col_character(),
+  CIG_DAY = col_double(),
+  YRS_EDUC = col_double(),
+  PHYS_ACT = col_logical(),
+  VAG_BLOOD = col_logical(),
+  WEEK_BLEED = col_logical(),
+  NTD_HIST = col_character(),
+  NTD_DESC = col_logical(),
+  ILL_AC_CR = col_logical(),
+  ILL_CODE1 = col_logical(),
+  ILL_CODE2 = col_logical(),
+  MULT_FETUS = col_double(),
+  WT_CLDLB = col_double(),
+  WT_CLDOZ = col_double(),
+  AGE_CLD_YR = col_double(),
+  AGE_CLD_MN = col_double(),
+  DATE_LMP = col_character(),
+  DATE_US = col_character(),
+  GAGE_US = col_double(),
+  DATE_PE = col_character(),
+  GAGE_PE = col_logical(),
+  RPT_GMETH = col_character(),
+  DO_FDS = col_character(),
+  RPT_DATE = col_character(),
+  TO_WHOM = col_double(),
+  TO_WHOM2 = col_logical(),
+  DOWN_CODE = col_character(),
+  NTD_CODE = col_character(),
+  AF_CODE = col_logical(),
+  HCG_CODE = col_character(),
+  NEW_DOWN = col_logical(),
+  NEW_NTD = col_character(),
+  NEW_AF = col_logical(),
+  NEW_HCG = col_logical(),
+  FU_CODE = col_logical(),
+  FU_DOB = col_logical(),
+  FU_WT_LB = col_double(),
+  FU_WT_OZ = col_double(),
+  FU_COMMENT = col_logical(),
+  MS1_NUM = col_double(),
+  MS1_DRAWN = col_character(),
+  MS1_RECVD = col_character(),
+  MS1_TESTED = col_character(),
+  MS1_RESULT = col_double(),
+  MS1_MOM = col_double(),
+  MS1_RISK = col_double(),
+  MS1_GEST = col_double(),
+  MS1_MATAGE = col_double(),
+  HCG1 = col_double(),
+  HCG1_MOM = col_double(),
+  EST1 = col_double(),
+  EST1_MOM = col_double(),
+  INHA1 = col_double(),
+  INHA1_MOM = col_double(),
+  ONTD1_RISK = col_double(),
+  ONTD1_FLAG = col_character(),
+  T181_RISK = col_double(),
+  ASFIRST1 = col_character(),
+  SLOS1RISK = col_double(),
+  U_RISK1 = col_logical(),
+  MS1_STATUS = col_character(),
+  MS2_NUM = col_double(),
+  MS2_DRAWN = col_character(),
+  MS2_RECVD = col_character(),
+  MS2_TESTED = col_character(),
+  MS2_RESULT = col_double(),
+  MS2_MOM = col_double(),
+  MS2_RISK = col_double(),
+  MS2_GEST = col_double(),
+  MS2_MATAGE = col_double(),
+  HCG2 = col_double(),
+  HCG2_MOM = col_double(),
+  EST2 = col_double(),
+  EST2_MOM = col_double(),
+  INHA2 = col_double(),
+  INHA2_MOM = col_double(),
+  ONTD2_RISK = col_double(),
+  ONTD2_FLAG = col_logical(),
+  T182_RISK = col_double(),
+  ASFIRST2 = col_character(),
+  SLOS2RISK = col_double(),
+  U_RISK2 = col_logical(),
+  MS2_STATUS = col_character(),
+  MS3_NUM = col_double(),
+  MS3_DRAWN = col_character(),
+  MS3_RECVD = col_character(),
+  MS3_TESTED = col_character(),
+  MS3_RESULT = col_double(),
+  MS3_MOM = col_double(),
+  MS3_RISK = col_double(),
+  MS3_GEST = col_double(),
+  MS3_MATAGE = col_double(),
+  HCG3 = col_double(),
+  HCG3_MOM = col_double(),
+  EST3 = col_double(),
+  EST3_MOM = col_double(),
+  INHA3 = col_double(),
+  INHA3_MOM = col_double(),
+  ONTD3_RISK = col_double(),
+  ONTD3_FLAG = col_logical(),
+  T183_RISK = col_double(),
+  ASFIRST3 = col_character(),
+  SLOS3RISK = col_double(),
+  U_RISK3 = col_logical(),
+  MS3_STATUS = col_character(),
+  AF1_PEND = col_double(),
+  AF1_NUM = col_logical(),
+  AF1_DRAWN = col_logical(),
+  AF1_RECVD = col_logical(),
+  AF1_TESTED = col_logical(),
+  AF1_RESULT = col_double(),
+  AF1_SD = col_double(),
+  AF1_GEST = col_double(),
+  AF1_MATAGE = col_double(),
+  AF1_RISK = col_logical(),
+  ACHE = col_logical(),
+  ACHE_PCHE = col_double(),
+  CONTAM_MAT = col_logical(),
+  CONTAM_FET = col_logical(),
+  DATA_ENTRY = col_character(),
+  LAST_ENTRY = col_character(),
+  AF1_STATUS = col_logical()
+)
+  
+file_in <- "MPI_02Feb2024_1513.csv"
+file_dirs <- c("Pathology_Analytics", "msAFP")
+if (.Platform$OS.type == 'windows') { fp_list <- c("I:", file_dirs, file_in)
+} else { fp_list <- c("/Volumes", file_dirs, file_in) }
+fp <- do.call(file.path, as.list(fp_list))
+
+maciel_df <- read_csv(fp, col_types = maciel_col_spec)
+```
+
+### Process Maciel
+```{r}
+# Handle date
+maciel_df <- maciel_df %>%
+  mutate(test_dt_tm = parse_date_time(MS1_TESTED, order="%-m/%-d/%Y %-H:%M:%S"))
+```
+
+### Merge into Cerner dataset
+```{r}
+### Merge
+df_wide <- df_wide %>%
+  left_join(maciel_df %>%
+              select(starts_with('MS1')), by=c("ACCESSION_NUM"="MS1_NUM"), suffix=c("", ".maciel"))
+```
+
+### Check
+```{r}
+discordant_AFPs <- df_wide %>%
+  filter(!is.na(MS1_RESULT)) %>%
+  filter(MS1_RESULT != AFP) %>%
+  select(EMPI, ORDER_ID, AFP, MS1_RESULT)
+discordant_AFPs
+```
+TODO: Review results for these patients/days
+
+### Exclude orders with discordant AFPs
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  anti_join(discordant_AFPs, by=c("EMPI", "ORDER_ID"))
+
+log_text <- 'Cerner and Maciel AFP discordant'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+### Input checking
+#### Weight
+```{r}
+df_wide %>%
+  ggplot(aes(x=weight)) +
+  geom_histogram()
+```
+
+#### Exclude weight outliers
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  filter(weight > 50 &
+           weight < 800)
+
+log_text <- 'Weight outliers'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+#### Number of fetuses
+```{r}
+df_wide %>% count(`Number of Fetuses.`)
+```
+
+#### Exclude number of fetuses not 1 or 2
+```{r}
+pre_df_sum <- df_wide %>%
+  summarize(N=n(),
+            N_pts = n_distinct(EMPI),
+            N_orders = n_distinct(ORDER_ID),
+            N_pt_days = n_distinct(EMPI, DRAWN_DT_TM))
+
+df_wide <- df_wide %>%
+  filter(`Number of Fetuses.` %in% 1:2)
+
+log_text <- 'Number of fetuses check'
+glue('[FILTER] {text}: Rows {n_start}->{n_end} (Diff: {n_diff})',
+      text=log_text, n_start = pre_df_sum$N, n_end = nrow(df_wide), n_diff = n_start - n_end)
+glue('[FILTER] {text}: Patients {pt_start}->{pt_end} (Diff: {pt_diff})',
+      text=log_text, pt_start = pre_df_sum$N_pts, pt_end = n_distinct(df_wide$EMPI), pt_diff = pt_start - pt_end)
+glue('[FILTER] {text}: Pts-days {pt_days_start}->{pt_days_end} (Diff: {pt_days_diff})',
+        text=log_text, pt_days_start = pre_df_sum$N_pt_days, pt_days_end = n_distinct(df_wide$EMPI, df_wide$DRAWN_DT_TM), pt_days_diff = pt_days_start - pt_days_end)
+```
+
+
+## Export data
+```{r}
+file_out_list <- c("..", "data", "msAFP.processed.csv")
+file_out_path <- do.call(file.path, as.list(file_out_list))
+write_csv(x=df_wide, file=file_out_path)
+```
+
+
